@@ -20,12 +20,16 @@ class ICSParser:
     """ICS 和 WakeUp 数据解析器"""
 
     def __init__(self):
-        self.course_cache: Dict[str, List[Dict]] = {}
+        self.course_cache: Dict[tuple[str, date], List[Dict]] = {}
 
     def parse_ics_file(self, file_path: str) -> List[Dict]:
         """解析 .ics 文件并返回课程列表，包括重复事件。使用缓存以提高性能。"""
-        if file_path in self.course_cache:
-            return self.course_cache[file_path]
+        shanghai_tz = timezone(timedelta(hours=8))
+        today = datetime.now(shanghai_tz).date()
+        parse_start_date = today - timedelta(days=today.weekday())
+        cache_key = (file_path, parse_start_date)
+        if cache_key in self.course_cache:
+            return self.course_cache[cache_key]
 
         courses = []
         try:
@@ -36,9 +40,6 @@ class ICSParser:
             return []
 
         cal = Calendar.from_ical(cal_content)
-        shanghai_tz = timezone(timedelta(hours=8))
-        today = datetime.now(shanghai_tz).date()
-
         for component in cal.walk():
             if component.name == "VEVENT":
                 summary = component.get("summary")
@@ -80,13 +81,13 @@ class ICSParser:
                     dtstart_utc = dtstart.astimezone(timezone.utc)
                     rrule = rrulestr(rrule_str.to_ical().decode(), dtstart=dtstart_utc)
 
-                    start_of_today_utc = datetime.now(timezone.utc).replace(
-                        hour=0, minute=0, second=0, microsecond=0
-                    )
-                    future_limit_utc = start_of_today_utc + timedelta(days=365)
+                    parse_start_utc = datetime.combine(
+                        parse_start_date, dt_time.min, tzinfo=shanghai_tz
+                    ).astimezone(timezone.utc)
+                    future_limit_utc = parse_start_utc + timedelta(days=365)
 
                     for occurrence_utc in rrule.between(
-                        start_of_today_utc, future_limit_utc, inc=True
+                        parse_start_utc, future_limit_utc, inc=True
                     ):
                         occurrence_local = occurrence_utc.astimezone(shanghai_tz)
                         courses.append(
@@ -99,7 +100,7 @@ class ICSParser:
                             }
                         )
                 else:
-                    if dtstart.date() >= today:
+                    if dtstart.date() >= parse_start_date:
                         courses.append(
                             {
                                 "summary": summary,
@@ -109,12 +110,14 @@ class ICSParser:
                                 "end_time": dtend,
                             }
                         )
-        self.course_cache[file_path] = courses
+        self.course_cache[cache_key] = courses
         return courses
 
     def clear_cache(self, file_path: str):
         """清除指定文件的缓存"""
-        self.course_cache.pop(file_path, None)
+        for cache_key in list(self.course_cache):
+            if cache_key[0] == file_path:
+                self.course_cache.pop(cache_key, None)
 
     def parse_wakeup_token(self, text: str) -> Optional[str]:
         """从文本中解析 WakeUp 分享口令"""

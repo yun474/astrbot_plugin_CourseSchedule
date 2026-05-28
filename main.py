@@ -201,6 +201,7 @@ class Main(Star):
         start_date,
         end_date,
         empty_message: str,
+        end_datetime=None,
     ):
         group_id = event.get_group_id()
         if not group_id:
@@ -223,9 +224,17 @@ class Main(Star):
             course_count = 0
 
             for course in courses:
-                course_date = course["start_time"].date()
+                course_start = course["start_time"]
+                course_end = course["end_time"]
+                course_date = course_start.date()
                 if start_date <= course_date <= end_date:
-                    total_duration += course["end_time"] - course["start_time"]
+                    if end_datetime is not None:
+                        if course_start >= end_datetime:
+                            continue
+                        course_end = min(course_end, end_datetime)
+                        if course_end <= course_start:
+                            continue
+                    total_duration += course_end - course_start
                     course_count += 1
 
             if course_count > 0:
@@ -248,12 +257,12 @@ class Main(Star):
         now = datetime.now(SHANGHAI_TZ)
         today = now.date()
         start_of_week = today - timedelta(days=today.weekday())
-        end_of_week = start_of_week + timedelta(days=6)
         return await self._build_ranking_data(
             event,
             start_of_week,
-            end_of_week,
+            today,
             "本周大家都没有课呢！",
+            end_datetime=now,
         )
 
     @filter.on_llm_request()
