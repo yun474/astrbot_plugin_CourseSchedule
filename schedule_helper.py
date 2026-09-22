@@ -53,7 +53,7 @@ class ScheduleHelper:
     def get_bind_hint(scope_id: str) -> str:
         where = "当前私聊" if scope_id == PRIVATE_SCOPE_ID else "本群"
         return (
-            f"你还没有在{where}绑定课表哦。请先发送 /绑定课表，然后在 60 秒内发送 .ics 课表文件；"
+            f"你还没有在{where}绑定课表哦。请先发送 /绑定课表，然后在 60 秒内发送 .ics 课表文件或 WakeUp 分享口令；"
             "如果已经在别处绑定过，也可以发送 /关联课表 绑定码 直接复用。"
         )
 

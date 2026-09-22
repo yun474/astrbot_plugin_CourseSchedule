@@ -10,6 +10,7 @@ from astrbot.core.star import Context, Star, star_map
 from astrbot.core.utils.io import download_file
 
 from . import qq_markdown as md
+from . import wakeup_client as wakeup
 from .data_manager import DataManager
 from .ics_parser import ICSParser
 from .image_generator import ImageGenerator
@@ -134,14 +135,15 @@ class Main(Star):
             "timestamp": time.time(),
             "nickname": self._display_name(event, nickname),
         }
-        prompt = f"请在 {BIND_TIMEOUT} 秒内，在{self._session_label(event)}直接发送你的 .ics 课表文件。"
+        where = self._session_label(event)
+        prompt = f"请在 {BIND_TIMEOUT} 秒内，在{where}直接发送你的 .ics 课表文件或 WakeUp 分享口令。"
         if md.is_qq_official(event) and not event.is_private_chat():
-            prompt += "\n群里发不了文件的话，可以先私聊绑定，再回群发送 /关联课表 绑定码。"
+            prompt += "\n群里发不了文件的话，可以发 WakeUp 口令，或先私聊绑定再回群发送 /关联课表 绑定码。"
         yield event.chain_result(self._mention(event) + [Plain(prompt)])
 
     @filter.event_message_type(filter.EventMessageType.ALL)
-    async def handle_file_message(self, event: AstrMessageEvent):
-        """绑定流程第二步：接收 .ics 文件"""
+    async def handle_binding_message(self, event: AstrMessageEvent):
+        """绑定流程第二步：接收 .ics 文件或 WakeUp 分享口令"""
         request_key = self._request_key(event)
         request = self.binding_requests.get(request_key)
         if not request:
@@ -151,7 +153,8 @@ class Main(Star):
             return
 
         file_component = next((m for m in event.get_messages() if isinstance(m, File)), None)
-        if not file_component:
+        share_code = wakeup.parse_share_code(event.message_str)
+        if not file_component and not share_code:
             return
         del self.binding_requests[request_key]
 
@@ -159,20 +162,24 @@ class Main(Star):
         user_id = event.get_sender_id()
         ics_file_path = self.data_manager.get_ics_file_path(user_id, scope_id)
         try:
-            source = await file_component.get_file(allow_return_url=True)
-            if source.startswith("http"):
-                await download_file(source, str(ics_file_path))
+            if file_component:
+                source = await file_component.get_file(allow_return_url=True)
+                if source.startswith("http"):
+                    await download_file(source, str(ics_file_path))
+                else:
+                    shutil.copyfile(source, ics_file_path)
             else:
-                shutil.copyfile(source, ics_file_path)
+                parts = await wakeup.fetch_wakeup_schedule(share_code)
+                ics_file_path.write_text(wakeup.convert_to_ics(parts), encoding="utf-8")
         except Exception as exc:
-            logger.error(f"获取课表文件失败: {exc}")
-            yield event.plain_result(f"获取课表文件失败，绑定未完成：{exc}")
+            logger.error(f"获取课表失败: {exc}")
+            yield event.plain_result(f"获取课表失败，绑定未完成：{exc}")
             return
 
         if self.ics_parser.count_events(str(ics_file_path)) <= 0:
             ics_file_path.unlink(missing_ok=True)
             yield event.plain_result(
-                "这个文件不是有效的 .ics 课表（没有解析到任何课程），请重新发送 /绑定课表 后上传正确的文件。"
+                "没有解析到任何课程，请确认发送的是有效的 .ics 课表文件或 WakeUp 分享口令，然后重新 /绑定课表。"
             )
             return
 
@@ -241,7 +248,7 @@ class Main(Star):
             return
         yield event.plain_result(
             "📚 课表助手\n"
-            "/绑定课表 [昵称] - 绑定 .ics 课表文件\n"
+            "/绑定课表 [昵称] - 用 .ics 文件或 WakeUp 口令绑定课表\n"
             "/关联课表 绑定码 - 复用已绑定的课表\n"
             "/解绑课表 - 解除当前会话的绑定\n"
             "/查看课表 - 今天还有什么课\n"
