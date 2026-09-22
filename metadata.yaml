@@ -2,7 +2,7 @@ name: astrbot_plugin_CourseSchedule
 display_name: 课程表
 desc: 绑定 .ics 课表，查询个人 / 群友课程与本周上课排行，支持 LLM 工具调用，官bot 可用 Markdown 卡片与按钮
 author: Jason.Joestar, yun474
-version: 1.2.0
+version: 2.0.0
 repo: https://github.com/yun474/astrbot_plugin_CourseSchedule
 support_platforms:
   - aiocqhttp
