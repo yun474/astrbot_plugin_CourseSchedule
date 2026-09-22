@@ -1,539 +1,260 @@
 import asyncio
-import os
-import re
-from datetime import date, datetime, timezone, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 PRIVATE_SCOPE_ID = "private"
 SHANGHAI_TZ = timezone(timedelta(hours=8))
 WEEKDAY_NAMES = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-WEEKDAY_ALIASES = {
-    "周一": 0,
-    "星期一": 0,
-    "礼拜一": 0,
-    "周二": 1,
-    "星期二": 1,
-    "礼拜二": 1,
-    "周三": 2,
-    "星期三": 2,
-    "礼拜三": 2,
-    "周四": 3,
-    "星期四": 3,
-    "礼拜四": 3,
-    "周五": 4,
-    "星期五": 4,
-    "礼拜五": 4,
-    "周六": 5,
-    "星期六": 5,
-    "礼拜六": 5,
-    "周日": 6,
-    "星期日": 6,
-    "星期天": 6,
-    "礼拜日": 6,
-    "礼拜天": 6,
-    "周天": 6,
-}
+
+
+def now() -> datetime:
+    return datetime.now(SHANGHAI_TZ)
+
+
+def today() -> date:
+    return now().date()
+
+
+def format_date(value: date, with_weekday: bool = True) -> str:
+    text = value.strftime("%Y-%m-%d")
+    return f"{text} {WEEKDAY_NAMES[value.weekday()]}" if with_weekday else text
+
+
+def format_time_range(course: dict) -> str:
+    return f"{course['start_time']:%H:%M}-{course['end_time']:%H:%M}"
+
+
+def format_minutes(total_minutes: int) -> str:
+    hours, minutes = divmod(max(total_minutes, 0), 60)
+    if hours and minutes:
+        return f"{hours} 小时 {minutes} 分钟"
+    return f"{hours} 小时" if hours else f"{minutes} 分钟"
 
 
 class ScheduleHelper:
-    """课表查询辅助类，包含通用的课表获取和验证逻辑"""
+    """课表查询辅助类，负责绑定校验、课程读取与筛选。"""
 
-    def __init__(self, data_manager, ics_parser, image_generator, user_data):
+    def __init__(self, data_manager, ics_parser, user_data: dict):
         self.data_manager = data_manager
         self.ics_parser = ics_parser
-        self.image_generator = image_generator
         self.user_data = user_data
+
+    # ---------- 作用域与绑定 ----------
 
     @staticmethod
     def get_scope_id(event) -> str:
-        """获取当前事件的课表作用域。群聊使用群号，私聊统一使用 private。"""
+        """群聊使用群号作为作用域，私聊统一使用 private。"""
         return event.get_group_id() or PRIVATE_SCOPE_ID
-
-    @staticmethod
-    def is_private_scope(scope_id: str) -> bool:
-        return scope_id == PRIVATE_SCOPE_ID
 
     @staticmethod
     def get_group_only_message() -> str:
         return "该功能仅支持群聊使用。"
 
-    def get_bind_hint(self, scope_id: str) -> str:
-        if self.is_private_scope(scope_id):
-            return (
-                "你还没有绑定课表哦，请先发送 /绑定课表，"
-                "然后在当前私聊发送 .ics 文件或 WakeUp 分享口令。"
-            )
+    @staticmethod
+    def get_bind_hint(scope_id: str) -> str:
+        where = "当前私聊" if scope_id == PRIVATE_SCOPE_ID else "本群"
         return (
-            "你还没有在这个群绑定课表哦，请在群内发送 /绑定课表 指令，"
-            "然后发送 .ics 文件或 WakeUp 分享口令来绑定。"
+            f"你还没有在{where}绑定课表哦。请先发送 /绑定课表，然后在 60 秒内发送 .ics 课表文件；"
+            "如果已经在别处绑定过，也可以发送 /关联课表 绑定码 直接复用。"
         )
 
-    @staticmethod
-    def get_today() -> date:
-        return datetime.now(SHANGHAI_TZ).date()
+    def get_user_record(self, scope_id: str, user_id: str) -> dict | None:
+        return self.user_data.get(scope_id, {}).get("users", {}).get(user_id)
 
-    @staticmethod
-    def _normalize_when(when: str | None) -> str:
-        return "".join(str(when or "").strip().lower().split())
+    def save_user_record(self, scope_id: str, user_id: str, record: dict) -> None:
+        self.user_data.setdefault(scope_id, {"users": {}}).setdefault("users", {})[user_id] = record
+        self.data_manager.save_user_data(self.user_data)
 
-    @staticmethod
-    def _normalize_date_label(label: str) -> str:
-        return {"今日": "今天", "明日": "明天"}.get(label, label)
+    def remove_user_record(self, scope_id: str, user_id: str) -> bool:
+        users = self.user_data.get(scope_id, {}).get("users", {})
+        if user_id not in users:
+            return False
+        del users[user_id]
+        self.data_manager.save_user_data(self.user_data)
+        return True
 
-    def _build_date_context(
-        self,
-        target_date: date,
-        when_key: str,
-        date_text: str,
-        title_suffix: str,
-        group_date_type: str,
-        group_title: str,
-        ranking_title: str,
-    ) -> dict:
-        return {
-            "target_date": target_date,
-            "when_key": when_key,
-            "date_text": date_text,
-            "title_suffix": title_suffix,
-            "group_date_type": group_date_type,
-            "group_title": group_title,
-            "empty_label": self._normalize_date_label(date_text),
-            "ranking_title": ranking_title,
-        }
-
-    def _build_named_date_context(
-        self,
-        target_date: date,
-        when_key: str,
-        date_text: str,
-        title_suffix: str,
-        group_date_type: str,
-        group_title: str,
-        ranking_title: str,
-    ) -> dict:
-        return self._build_date_context(
-            target_date=target_date,
-            when_key=when_key,
-            date_text=date_text,
-            title_suffix=title_suffix,
-            group_date_type=group_date_type,
-            group_title=group_title,
-            ranking_title=ranking_title,
-        )
-
-    def _build_custom_date_context(self, target_date: date, display_label: str) -> dict:
-        return self._build_date_context(
-            target_date=target_date,
-            when_key="custom",
-            date_text=display_label,
-            title_suffix=f"的{display_label}课程",
-            group_date_type=display_label,
-            group_title=f"群友{display_label}第一节课程",
-            ranking_title=f"{display_label}上课排行榜",
-        )
-
-    def _resolve_weekday_date(self, token: str, today: date) -> tuple[date, str] | None:
-        prefix = ""
-        weekday_token = token
-        for candidate in ("这周", "本周", "这星期", "本星期", "下周", "下星期"):
-            if token.startswith(candidate):
-                prefix = candidate
-                weekday_token = token[len(candidate) :]
-                break
-
-        if weekday_token not in WEEKDAY_ALIASES:
-            return None
-
-        target_weekday = WEEKDAY_ALIASES[weekday_token]
-        weekday_delta = target_weekday - today.weekday()
-
-        if prefix in {"下周", "下星期"}:
-            weekday_delta += 7
-        elif prefix not in {"这周", "本周", "这星期", "本星期"}:
-            weekday_delta %= 7
-
-        return today + timedelta(days=weekday_delta), WEEKDAY_NAMES[target_weekday]
-
-    def _resolve_calendar_date(self, token: str, today: date) -> tuple[date, str] | None:
-        full_match = re.fullmatch(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", token)
-        if full_match:
-            year, month, day = map(int, full_match.groups())
-            return date(year, month, day), f"{year:04d}-{month:02d}-{day:02d}"
-
-        short_match = re.fullmatch(r"(\d{1,2})[-/](\d{1,2})", token)
-        if short_match:
-            month, day = map(int, short_match.groups())
-            target_date = date(today.year, month, day)
-            return target_date, target_date.strftime("%Y-%m-%d")
-
+    def find_record_by_code(self, code: str) -> tuple[str, str, dict] | None:
+        """按绑定码查找记录，返回 (scope_id, user_id, record)。"""
+        for scope_id, scope in self.user_data.items():
+            for user_id, record in scope.get("users", {}).items():
+                if record.get("code") == code:
+                    return scope_id, user_id, record
         return None
 
-    def resolve_target_date(
-        self, when: str | None, default: str = "today"
-    ) -> tuple[dict | None, str | None]:
-        """解析自然语言日期，返回统一的日期上下文。"""
-        token = self._normalize_when(when or default)
-        if not token:
-            token = default
+    # ---------- 课程读取 ----------
 
-        today = self.get_today()
-        special_date_map = {
-            "today": self._build_named_date_context(
-                today,
-                "today",
-                "今天",
-                "的今日课程",
-                "today",
-                "群友当前 / 下一节课程",
-                "今日上课排行榜",
-            ),
-            "今天": self._build_named_date_context(
-                today,
-                "today",
-                "今天",
-                "的今日课程",
-                "today",
-                "群友当前 / 下一节课程",
-                "今日上课排行榜",
-            ),
-            "tomorrow": self._build_named_date_context(
-                today + timedelta(days=1),
-                "tomorrow",
-                "明天",
-                "的明日课程",
-                "tomorrow",
-                "群友明日第一节课程",
-                "明日上课排行榜",
-            ),
-            "明天": self._build_named_date_context(
-                today + timedelta(days=1),
-                "tomorrow",
-                "明天",
-                "的明日课程",
-                "tomorrow",
-                "群友明日第一节课程",
-                "明日上课排行榜",
-            ),
-            "day_after_tomorrow": self._build_named_date_context(
-                today + timedelta(days=2),
-                "day_after_tomorrow",
-                "后天",
-                "的后天课程",
-                "后天",
-                "群友后天第一节课程",
-                "后天上课排行榜",
-            ),
-            "dayaftertomorrow": self._build_named_date_context(
-                today + timedelta(days=2),
-                "day_after_tomorrow",
-                "后天",
-                "的后天课程",
-                "后天",
-                "群友后天第一节课程",
-                "后天上课排行榜",
-            ),
-            "后天": self._build_named_date_context(
-                today + timedelta(days=2),
-                "day_after_tomorrow",
-                "后天",
-                "的后天课程",
-                "后天",
-                "群友后天第一节课程",
-                "后天上课排行榜",
-            ),
-            "后日": self._build_named_date_context(
-                today + timedelta(days=2),
-                "day_after_tomorrow",
-                "后天",
-                "的后天课程",
-                "后天",
-                "群友后天第一节课程",
-                "后天上课排行榜",
-            ),
-        }
-        if token in special_date_map:
-            return special_date_map[token], None
+    async def load_courses(self, user_id: str, scope_id: str) -> list[dict]:
+        ics_file_path = self.data_manager.get_ics_file_path(user_id, scope_id)
+        if not ics_file_path.exists():
+            return []
+        return await asyncio.to_thread(self.ics_parser.parse_ics_file, str(ics_file_path))
 
-        weekday_result = self._resolve_weekday_date(token, today)
-        if weekday_result:
-            target_date, display_label = weekday_result
-            return self._build_custom_date_context(target_date, display_label), None
-
-        try:
-            calendar_result = self._resolve_calendar_date(token, today)
-            if calendar_result:
-                target_date, display_label = calendar_result
-                return self._build_custom_date_context(target_date, display_label), None
-        except ValueError:
-            return None, "无法识别日期，请使用今天/明天/后天、周几，或 YYYY-MM-DD 这类日期格式。"
-
-        return None, (
-            "参数 when 支持 today、tomorrow、day_after_tomorrow、今天、明天、后天、"
-            "周几，或 YYYY-MM-DD / YYYY/MM/DD / M-D / M/D。"
-        )
-
-    def get_date_range_text(self, start_date: date, end_date: date) -> str:
-        if start_date == end_date:
-            return f"统计日期：{start_date.strftime('%Y/%m/%d')}"
-        return f"统计时间：{start_date.strftime('%Y/%m/%d')} - {end_date.strftime('%Y/%m/%d')}"
-
-    async def get_schedule_for_date(self, event, target_date, date_description):
-        """根据指定日期获取个人课程安排，包含完整的用户验证逻辑"""
+    async def _load_personal_courses(self, event) -> tuple[list[dict] | None, str | None]:
+        """读取当前用户的全部课程并附上昵称，未绑定时返回提示。"""
         user_id = event.get_sender_id()
         scope_id = self.get_scope_id(event)
-
-        if (
-            scope_id not in self.user_data
-            or user_id not in self.user_data[scope_id].get("users", {})
-        ):
+        record = self.get_user_record(scope_id, user_id)
+        if record is None:
             return None, self.get_bind_hint(scope_id)
-
-        ics_file_path = self.data_manager.get_ics_file_path(user_id, scope_id)
-        if not os.path.exists(ics_file_path):
+        if not self.data_manager.get_ics_file_path(user_id, scope_id).exists():
             return None, "课表文件不存在，可能已被删除。请重新绑定。"
 
-        courses = await asyncio.to_thread(
-            self.ics_parser.parse_ics_file, str(ics_file_path)
-        )
-
-        target_courses = []
-        now = datetime.now(SHANGHAI_TZ)
+        courses = await self.load_courses(user_id, scope_id)
         for course in courses:
-            if course["start_time"].date() == target_date:
-                # Only filter by current time for today
-                if target_date == now.date():
-                    if course["end_time"] > now:
-                        target_courses.append(course)
-                else:
-                    # For future dates, include all courses
-                    target_courses.append(course)
+            course["nickname"] = record.get("nickname", user_id)
+        return courses, None
 
+    async def get_personal_courses(
+        self, event, target_date: date, include_finished: bool = False
+    ) -> tuple[list[dict] | None, str | None]:
+        """获取用户某天的课程。默认过滤掉今天已经结束的课。"""
+        courses, error_msg = await self._load_personal_courses(event)
+        if error_msg:
+            return None, error_msg
+
+        current = now()
+        target_courses = [
+            c
+            for c in courses
+            if c["start_time"].date() == target_date
+            and (include_finished or target_date != current.date() or c["end_time"] > current)
+        ]
         if not target_courses:
-            date_label = date_description.removeprefix("的").removesuffix("课程")
-            date_label = self._normalize_date_label(date_label)
-            return None, f"你{date_label}没有课啦！"
+            label = {0: "今天", 1: "明天"}.get((target_date - current.date()).days, format_date(target_date))
+            return None, f"你{label}没有课啦！"
 
-        # Sort courses by start time
-        target_courses.sort(key=lambda x: x["start_time"])
-
-        # Add nickname to each course for image generation
-        for course in target_courses:
-            nickname = (
-                self.user_data[scope_id]["users"]
-                .get(user_id, {})
-                .get("nickname", user_id)
-            )
-            course["nickname"] = nickname
-
+        target_courses.sort(key=lambda c: c["start_time"])
         return target_courses, None
 
+    async def get_personal_week_courses(
+        self, event
+    ) -> tuple[list[dict] | None, date, date, str | None]:
+        """获取用户本周（周一到周日）的全部课程。"""
+        current_date = today()
+        start = current_date - timedelta(days=current_date.weekday())
+        end = start + timedelta(days=6)
+        courses, error_msg = await self._load_personal_courses(event)
+        if error_msg:
+            return None, start, end, error_msg
+
+        week_courses = sorted(
+            (c for c in courses if start <= c["start_time"].date() <= end),
+            key=lambda c: c["start_time"],
+        )
+        return week_courses, start, end, None
+
     async def get_group_schedule_for_date(
-        self,
-        event,
-        target_date,
-        is_today=True,
-        empty_label: str | None = None,
-    ):
-        """根据指定日期获取群友课程安排
+        self, event, target_date: date, is_today: bool = True
+    ) -> tuple[list[dict] | None, str | None]:
+        """获取群友某天的课程状态：今天取正在上/下一节，其他日期取第一节。
 
-        Args:
-            event: 消息事件
-            target_date: 目标日期
-            is_today: 是否为今天，True时优先显示正在进行的课程，False时显示最早的课程
-            empty_label: 无课时使用的日期标签，如“今日”“明日”“后天”
-
-        Returns:
-            tuple: (课程列表, 错误信息)
+        每位已绑定的群友都会有一行，无课时 start_time / end_time 为 None。
         """
         group_id = event.get_group_id()
-        if not group_id or group_id not in self.user_data:
+        if not group_id or not self.user_data.get(group_id, {}).get("users"):
             return None, "本群还没有人绑定课表哦。"
 
-        # 使用上海时区 (UTC+8)
-        now = datetime.now(SHANGHAI_TZ)
-        next_courses = []
+        current = now()
+        rows = []
+        for user_id, record in self.user_data[group_id]["users"].items():
+            courses = [
+                c
+                for c in await self.load_courses(user_id, group_id)
+                if c["start_time"].date() == target_date
+            ]
+            if is_today:
+                courses = [c for c in courses if c["end_time"] > current]
+            picked = min(courses, key=lambda c: c["start_time"], default=None)
 
-        group_users = self.user_data[group_id].get("users", {})
-        for user_id, user_info in group_users.items():
-            nickname = user_info.get("nickname", user_id)
-            ics_file_path = self.data_manager.get_ics_file_path(user_id, group_id)
-            if not os.path.exists(ics_file_path):
-                continue
-
-            courses = await asyncio.to_thread(
-                self.ics_parser.parse_ics_file, str(ics_file_path)
+            rows.append(
+                {
+                    "summary": picked["summary"] if picked else f"{'今天' if is_today else '明天'}无课",
+                    "description": picked["description"] if picked else "",
+                    "location": picked["location"] if picked else "",
+                    "start_time": picked["start_time"] if picked else None,
+                    "end_time": picked["end_time"] if picked else None,
+                    "user_id": user_id,
+                    "nickname": record.get("nickname", user_id),
+                }
             )
 
-            # 筛选目标日期的课程
-            target_date_courses = [
-                c
-                for c in courses
-                if c.get("start_time") and c.get("start_time").date() == target_date
-            ]
+        if not rows:
+            return None, "本群还没有人绑定课表哦。"
 
-            user_next_course = None
-            if is_today:
-                # 今天的方法：优先找正在进行的课程，否则找接下来的课程
-                user_current_course = None
-                user_future_course = None
+        # 无课的群友排在最后
+        rows.sort(key=lambda r: (r["start_time"] is None, r["start_time"] or current))
+        return rows, None
 
-                for course in target_date_courses:
-                    start_time = course.get("start_time")
-                    end_time = course.get("end_time")
+    async def get_weekly_ranking(self, event) -> tuple[list[dict] | None, date, date, str | None]:
+        """统计本周一到现在为止每位群友已经上过的课时。"""
+        current = now()
+        end_date = current.date()
+        start_date = end_date - timedelta(days=end_date.weekday())
 
-                    if start_time and end_time:
-                        # 检查是否是正在进行的课程
-                        if start_time <= now < end_time:
-                            user_current_course = course
-                            break  # 找到正在上的课，就不需要再找下一节了
+        group_id = event.get_group_id()
+        if not group_id:
+            return None, start_date, end_date, self.get_group_only_message()
+        if not self.user_data.get(group_id, {}).get("users"):
+            return None, start_date, end_date, "本群还没有人绑定课表哦。"
 
-                        # 检查是否是未来的课程
-                        elif start_time > now:
-                            if (
-                                user_future_course is None
-                                or start_time < user_future_course.get("start_time")
-                            ):
-                                user_future_course = course
-
-                # 优先显示正在上的课
-                user_next_course = (
-                    user_current_course if user_current_course else user_future_course
+        ranking = []
+        for user_id, record in self.user_data[group_id]["users"].items():
+            total_duration = timedelta()
+            course_count = 0
+            for course in await self.load_courses(user_id, group_id):
+                if not (start_date <= course["start_time"].date() <= end_date):
+                    continue
+                if course["start_time"] >= current:
+                    continue
+                total_duration += min(course["end_time"], current) - course["start_time"]
+                course_count += 1
+            if course_count:
+                ranking.append(
+                    {
+                        "user_id": user_id,
+                        "nickname": record.get("nickname", user_id),
+                        "total_duration": total_duration,
+                        "course_count": course_count,
+                    }
                 )
-            else:
-                # 明天的方法：找最早的一节课
-                for course in target_date_courses:
-                    start_time = course.get("start_time")
-                    if start_time:
-                        # 找到最早的课程
-                        if user_next_course is None or start_time < user_next_course.get(
-                            "start_time"
-                        ):
-                            user_next_course = course
 
-            # 无论用户当天是否有课，都为他创建一个条目
-            if user_next_course:
-                # 用户有课
-                user_course_copy = {
-                    "summary": user_next_course["summary"],
-                    "description": user_next_course["description"],
-                    "location": user_next_course["location"],
-                    "start_time": user_next_course["start_time"],
-                    "end_time": user_next_course["end_time"],
-                    "user_id": user_id,
-                    "nickname": nickname,
-                }
-            else:
-                # 用户当天没课
-                normalized_label = self._normalize_date_label(empty_label or ("今天" if is_today else "明天"))
-                summary = f"{normalized_label}无课"
-                user_course_copy = {
-                    "summary": summary,
-                    "description": "",
-                    "location": "",
-                    "start_time": None,  # 标记为无课
-                    "end_time": None,
-                    "user_id": user_id,
-                    "nickname": nickname,
-                }
-            next_courses.append(user_course_copy)
+        if not ranking:
+            return None, start_date, end_date, "本周大家都没有课呢！"
+        ranking.sort(key=lambda item: item["total_duration"], reverse=True)
+        return ranking, start_date, end_date, None
 
-        if not next_courses:
-            normalized_label = self._normalize_date_label(empty_label or ("接下来" if is_today else "当天"))
-            return None, f"群友们{normalized_label}都没有课啦！"
-
-        # 排序时，将无课的用户（start_time is None）排在最后
-        next_courses.sort(key=lambda x: (x["start_time"] is None, x["start_time"]))
-
-        return next_courses, None
+    # ---------- LLM 文本 ----------
 
     @staticmethod
-    def _normalize_text(value: str | None) -> str:
-        if not value:
-            return ""
-        return " ".join(str(value).split())
+    def format_course_line(course: dict) -> str:
+        line = f"{course['summary']} {format_time_range(course)}"
+        if course.get("location"):
+            line += f" @ {course['location']}"
+        if course.get("description"):
+            line += f"（{course['description']}）"
+        return line
 
-    def format_personal_schedule_text(self, courses, title_suffix: str) -> str:
-        """将个人课表格式化为适合 LLM 返回的文本。"""
-        if not courses:
-            return "没有可展示的课程。"
-
-        nickname = self._normalize_text(courses[0].get("nickname")) or "你"
-        lines = [f"{nickname}{title_suffix}："]
-
-        for index, course in enumerate(courses, start=1):
-            summary = self._normalize_text(course.get("summary")) or "未命名课程"
-            location = self._normalize_text(course.get("location"))
-            description = self._normalize_text(course.get("description"))
-            start_time = course.get("start_time")
-            end_time = course.get("end_time")
-            time_str = f"{start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')}"
-
-            lines.append(f"{index}. {summary}")
-            lines.append(f"时间：{time_str}")
-            if location:
-                lines.append(f"地点：{location}")
-            if description:
-                lines.append(f"备注：{description}")
-
-        return "\n".join(lines)
-
-    def format_group_schedule_text(self, courses, is_today: bool = True, title: str | None = None) -> str:
-        """将群友课表格式化为适合 LLM 返回的文本。"""
-        if not courses:
-            return "没有可展示的群友课表。"
-
-        now = datetime.now(SHANGHAI_TZ)
-        title = title or ("群友当前 / 下一节课程" if is_today else "群友明日第一节课程")
-        lines = [f"{title}："]
-
-        for index, course in enumerate(courses, start=1):
-            nickname = self._normalize_text(course.get("nickname")) or "未命名群友"
-            summary = self._normalize_text(course.get("summary")) or "无课程"
-            location = self._normalize_text(course.get("location"))
-            start_time = course.get("start_time")
-            end_time = course.get("end_time")
-
-            if not start_time or not end_time:
-                lines.append(f"{index}. {nickname}：{summary}")
-                continue
-
-            if is_today:
-                status = "正在上"
-                if start_time > now:
-                    status = "下一节"
-            else:
-                status = "第一节"
-
-            time_str = f"{start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')}"
-            course_line = f"{index}. {nickname}：{status} {summary}（{time_str}）"
-            if location:
-                course_line += f" @ {location}"
-            lines.append(course_line)
-
-        return "\n".join(lines)
-
-    def format_ranking_text(
-        self,
-        ranking_data,
-        start_of_week,
-        end_of_week,
-        title: str = "本周上课排行榜",
-    ) -> str:
-        """将排行榜数据格式化为适合 LLM 返回的文本。"""
-        if not ranking_data:
-            return "当前条件下大家都没有课呢！"
-
+    def format_day_for_llm(self, courses: list[dict], label: str, target_date: date) -> str:
+        current = now()
         lines = [
-            f"{title}：",
-            self.get_date_range_text(start_of_week, end_of_week),
+            f"现在是 {format_date(current.date())} {current:%H:%M}。",
+            f"{label}（{format_date(target_date)}）共 {len(courses)} 节课：",
         ]
+        lines += [f"{i}. {self.format_course_line(c)}" for i, c in enumerate(courses, 1)]
+        return "\n".join(lines)
 
-        for index, item in enumerate(ranking_data, start=1):
-            nickname = self._normalize_text(item.get("nickname")) or str(item.get("user_id", "未知用户"))
-            total_duration = item.get("total_duration")
-            total_hours = int(total_duration.total_seconds() // 3600)
-            remaining_minutes = int((total_duration.total_seconds() % 3600) // 60)
-            lines.append(
-                f"{index}. {nickname}：{total_hours} 小时 {remaining_minutes} 分钟，共 {item.get('course_count', 0)} 节课"
-            )
-
+    def format_week_for_llm(self, courses: list[dict], start: date, end: date) -> str:
+        current = now()
+        lines = [
+            f"现在是 {format_date(current.date())} {current:%H:%M}。",
+            f"本周（{format_date(start, False)} ~ {format_date(end, False)}）共 {len(courses)} 节课：",
+        ]
+        for offset in range(7):
+            day = start + timedelta(days=offset)
+            day_courses = [c for c in courses if c["start_time"].date() == day]
+            tag = "（今天）" if day == current.date() else ""
+            if not day_courses:
+                lines.append(f"{WEEKDAY_NAMES[offset]} {day:%m-%d}{tag}：无课")
+                continue
+            lines.append(f"{WEEKDAY_NAMES[offset]} {day:%m-%d}{tag}：")
+            lines += [f"  {i}. {self.format_course_line(c)}" for i, c in enumerate(day_courses, 1)]
         return "\n".join(lines)

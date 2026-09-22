@@ -1,241 +1,122 @@
 # -*- coding: utf-8 -*-
 """
-本模块负责处理 .ics 文件和 WakeUp 口令的解析、转换和数据获取。
+本模块负责解析 .ics 日历文件，把课程展开为按周缓存的课程列表。
 """
-import json
-import re
-import asyncio
-from datetime import datetime, timezone, timedelta, date, time as dt_time
-from typing import Dict, List, Optional
+from datetime import date, datetime, time as dt_time, timedelta, timezone
+from typing import Dict, List
 
-import aiohttp
-from icalendar import Calendar, Event
 from dateutil.rrule import rrulestr
+from icalendar import Calendar
 
 from astrbot.api import logger
 
-WAKEUP_REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=15, connect=5, sock_read=10)
+SHANGHAI_TZ = timezone(timedelta(hours=8))
+
+
+def _to_local_datetime(value, tz: timezone) -> datetime:
+    """把 icalendar 给出的 date / datetime 统一成带时区的 datetime。"""
+    if isinstance(value, datetime):
+        return value.astimezone(tz) if value.tzinfo else value.replace(tzinfo=tz)
+    return datetime.combine(value, dt_time.min, tzinfo=tz)
+
 
 class ICSParser:
-    """ICS 和 WakeUp 数据解析器"""
+    """ICS 课表解析器，每个文件只缓存当前周的展开结果。"""
 
     def __init__(self):
-        self.course_cache: Dict[tuple[str, date], List[Dict]] = {}
+        # file_path -> (本周一日期, 课程列表)
+        self.course_cache: Dict[str, tuple[date, List[Dict]]] = {}
 
-    def parse_ics_file(self, file_path: str) -> List[Dict]:
-        """解析 .ics 文件并返回课程列表，包括重复事件。使用缓存以提高性能。"""
-        shanghai_tz = timezone(timedelta(hours=8))
-        today = datetime.now(shanghai_tz).date()
-        parse_start_date = today - timedelta(days=today.weekday())
-        cache_key = (file_path, parse_start_date)
-        if cache_key in self.course_cache:
-            return self.course_cache[cache_key]
-
-        courses = []
+    @staticmethod
+    def count_events(file_path: str) -> int:
+        """统计文件中的 VEVENT 数量，解析失败返回 -1。用于绑定时校验文件。"""
         try:
             with open(file_path, "r", encoding="utf-8") as f:
-                cal_content = f.read()
-        except (FileNotFoundError, IOError) as e:
-            logger.error(f"无法读取 ICS 文件 {file_path}: {e}")
+                cal = Calendar.from_ical(f.read())
+        except Exception as e:
+            logger.warning(f"ICS 文件校验失败 {file_path}: {e}")
+            return -1
+        return sum(1 for component in cal.walk() if component.name == "VEVENT")
+
+    def parse_ics_file(self, file_path: str) -> List[Dict]:
+        """解析 .ics 文件并返回从本周一开始一年内的课程列表（含重复事件展开）。"""
+        today = datetime.now(SHANGHAI_TZ).date()
+        parse_start_date = today - timedelta(days=today.weekday())
+        cached = self.course_cache.get(file_path)
+        if cached and cached[0] == parse_start_date:
+            return cached[1]
+
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                cal = Calendar.from_ical(f.read())
+        except Exception as e:
+            logger.error(f"无法解析 ICS 文件 {file_path}: {e}")
             return []
 
-        cal = Calendar.from_ical(cal_content)
+        courses: List[Dict] = []
         for component in cal.walk():
-            if component.name == "VEVENT":
-                summary = component.get("summary")
-                description = component.get("description")
-                location = component.get("location")
-                dtstart = component.get("dtstart").dt
-                dtend = component.get("dtend").dt
-                rrule_str = component.get("rrule")
+            if component.name != "VEVENT":
+                continue
+            try:
+                courses.extend(self._expand_event(component, parse_start_date))
+            except Exception as e:
+                logger.warning(f"跳过无法解析的课程事件（{file_path}）: {e}")
 
-                if isinstance(dtstart, date) and not isinstance(dtstart, datetime):
-                    dtstart = datetime.combine(dtstart, dt_time.min)
-                if isinstance(dtend, date) and not isinstance(dtend, datetime):
-                    dtend = datetime.combine(dtend, dt_time.min)
+        self.course_cache[file_path] = (parse_start_date, courses)
+        return courses
 
-                dtstart = (
-                    dtstart.astimezone(shanghai_tz)
-                    if dtstart.tzinfo
-                    else dtstart.replace(tzinfo=shanghai_tz)
-                )
-                dtend = (
-                    dtend.astimezone(shanghai_tz)
-                    if dtend.tzinfo
-                    else dtend.replace(tzinfo=shanghai_tz)
-                )
+    def _expand_event(self, component, parse_start_date: date) -> List[Dict]:
+        """把单个 VEVENT 展开成课程字典列表。"""
+        dtstart_prop = component.get("dtstart")
+        if dtstart_prop is None:
+            return []
+        dtstart = _to_local_datetime(dtstart_prop.dt, SHANGHAI_TZ)
 
-                course_duration = dtend - dtstart
+        dtend_prop = component.get("dtend")
+        if dtend_prop is not None:
+            dtend = _to_local_datetime(dtend_prop.dt, SHANGHAI_TZ)
+        elif component.get("duration") is not None:
+            dtend = dtstart + component.get("duration").dt
+        else:
+            dtend = dtstart
+        course_duration = dtend - dtstart
 
-                if rrule_str:
-                    if "UNTIL" in rrule_str:
-                        until_dt = rrule_str["UNTIL"][0]
-                        if isinstance(until_dt, date) and not isinstance(
-                            until_dt, datetime
-                        ):
-                            until_dt = datetime.combine(until_dt, dt_time.max)
-                        if until_dt.tzinfo is None:
-                            until_dt = until_dt.replace(tzinfo=shanghai_tz)
-                        rrule_str["UNTIL"][0] = until_dt.astimezone(timezone.utc)
+        base = {
+            "summary": str(component.get("summary") or "未命名课程"),
+            "description": str(component.get("description") or ""),
+            "location": str(component.get("location") or ""),
+        }
 
-                    dtstart_utc = dtstart.astimezone(timezone.utc)
-                    rrule = rrulestr(rrule_str.to_ical().decode(), dtstart=dtstart_utc)
+        rrule_prop = component.get("rrule")
+        if not rrule_prop:
+            if dtstart.date() < parse_start_date:
+                return []
+            return [{**base, "start_time": dtstart, "end_time": dtend}]
 
-                    parse_start_utc = datetime.combine(
-                        parse_start_date, dt_time.min, tzinfo=shanghai_tz
-                    ).astimezone(timezone.utc)
-                    future_limit_utc = parse_start_utc + timedelta(days=365)
+        if "UNTIL" in rrule_prop:
+            until_dt = rrule_prop["UNTIL"][0]
+            if not isinstance(until_dt, datetime):
+                until_dt = datetime.combine(until_dt, dt_time.max)
+            if until_dt.tzinfo is None:
+                until_dt = until_dt.replace(tzinfo=SHANGHAI_TZ)
+            rrule_prop["UNTIL"][0] = until_dt.astimezone(timezone.utc)
 
-                    for occurrence_utc in rrule.between(
-                        parse_start_utc, future_limit_utc, inc=True
-                    ):
-                        occurrence_local = occurrence_utc.astimezone(shanghai_tz)
-                        courses.append(
-                            {
-                                "summary": summary,
-                                "description": description,
-                                "location": location,
-                                "start_time": occurrence_local,
-                                "end_time": occurrence_local + course_duration,
-                            }
-                        )
-                else:
-                    if dtstart.date() >= parse_start_date:
-                        courses.append(
-                            {
-                                "summary": summary,
-                                "description": description,
-                                "location": location,
-                                "start_time": dtstart,
-                                "end_time": dtend,
-                            }
-                        )
-        self.course_cache[cache_key] = courses
+        rrule = rrulestr(
+            rrule_prop.to_ical().decode(), dtstart=dtstart.astimezone(timezone.utc)
+        )
+        window_start = datetime.combine(
+            parse_start_date, dt_time.min, tzinfo=SHANGHAI_TZ
+        ).astimezone(timezone.utc)
+        window_end = window_start + timedelta(days=365)
+
+        courses = []
+        for occurrence in rrule.between(window_start, window_end, inc=True):
+            start_local = occurrence.astimezone(SHANGHAI_TZ)
+            courses.append(
+                {**base, "start_time": start_local, "end_time": start_local + course_duration}
+            )
         return courses
 
     def clear_cache(self, file_path: str):
         """清除指定文件的缓存"""
-        for cache_key in list(self.course_cache):
-            if cache_key[0] == file_path:
-                self.course_cache.pop(cache_key, None)
-
-    def parse_wakeup_token(self, text: str) -> Optional[str]:
-        """从文本中解析 WakeUp 分享口令"""
-        match = re.search(r"「([a-f0-9]{32})」", text)
-        if match:
-            return match.group(1)
-        return None
-
-    async def fetch_wakeup_schedule(self, token: str) -> Optional[List]:
-        """通过 WakeUp API 获取课程表数据"""
-        url = f"https://i.wakeup.fun/share_schedule/get?key={token}"
-        async with aiohttp.ClientSession(timeout=WAKEUP_REQUEST_TIMEOUT) as session:
-            try:
-                async with session.get(url) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        if data.get("status") == 1:
-                            # Wakeup 的数据是多个 JSON 对象拼接成的字符串，需要分割
-                            parts = data["data"].strip().split("\n")
-                            json_parts = [json.loads(p) for p in parts]
-                            return json_parts
-                        else:
-                            logger.error(
-                                f"WakeUp API returned error: {data.get('message')}"
-                            )
-                            return None
-                    else:
-                        logger.error(
-                            f"Failed to fetch WakeUp schedule, status code: {response.status}"
-                        )
-                        return None
-            except (
-                aiohttp.ClientError,
-                asyncio.TimeoutError,
-                json.JSONDecodeError,
-            ) as e:
-                logger.error(f"Error fetching WakeUp schedule: {e}")
-                return None
-
-    def convert_wakeup_to_ics(self, data: List) -> Optional[str]:
-        """将 WakeUp JSON 数据转换为 ICS 格式"""
-        try:
-            # Wakeup 的数据是多个 JSON 对象拼接成的字符串，需要分割
-            # data 已经是 fetch_wakeup_schedule 解析后的列表了
-            time_table_info = data[1]  # 时间表
-            schedule_settings = data[2]  # 课表设置
-            course_definitions = data[3]  # 课程定义
-            course_arrangements = data[4]  # 课程安排
-
-            course_id_to_name = {c["id"]: c["courseName"] for c in course_definitions}
-
-            start_date_str = schedule_settings.get("startDate", "2023-09-04")
-            start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
-
-            cal = Calendar()
-            cal.add("prodid", "-//WakeUp Schedule Converter//")
-            cal.add("version", "2.0")
-
-            for arrangement in course_arrangements:
-                course_def_id = arrangement.get("id")
-                course_name = course_id_to_name.get(course_def_id, "未知课程")
-
-                start_week = arrangement.get("startWeek")
-                end_week = arrangement.get("endWeek")
-                day_of_week = arrangement.get("day")
-                start_node = arrangement.get("startNode")
-                step = arrangement.get("step", 1)
-
-                teacher = arrangement.get("teacher", "")
-                room = arrangement.get("room", "")
-
-                start_time_str = "00:00"
-                end_time_str = "00:00"
-                for time_slot in time_table_info:
-                    if time_slot.get("node") == start_node:
-                        start_time_str = time_slot.get("startTime", "00:00")
-                        end_node = start_node + step - 1
-                        for end_slot in time_table_info:
-                            if end_slot.get("node") == end_node:
-                                end_time_str = end_slot.get("endTime", "00:00")
-                                break
-                        break
-
-                start_time = dt_time.fromisoformat(start_time_str)
-                end_time = dt_time.fromisoformat(end_time_str)
-
-                weekday_map = ["MO", "TU", "WE", "TH", "FR", "SA", "SU"]
-                byday = weekday_map[day_of_week - 1]
-
-                first_day_offset = day_of_week - start_date.weekday() - 1
-                if first_day_offset < 0:
-                    first_day_offset += 7
-                first_day = start_date + timedelta(
-                    weeks=start_week - 1, days=first_day_offset
-                )
-
-                last_day_offset = day_of_week - start_date.weekday() - 1
-                if last_day_offset < 0:
-                    last_day_offset += 7
-                last_day = start_date + timedelta(
-                    weeks=end_week - 1, days=last_day_offset
-                )
-                until_datetime = datetime.combine(last_day, end_time)
-
-                event = Event()
-                event.add("summary", course_name)
-                event.add("dtstart", datetime.combine(first_day, start_time))
-                event.add("dtend", datetime.combine(first_day, end_time))
-                event.add(
-                    "rrule", {"freq": "weekly", "byday": byday, "until": until_datetime}
-                )
-                event.add("location", room)
-                event.add("description", f"教师: {teacher}")
-
-                cal.add_component(event)
-
-            return cal.to_ical().decode("utf-8")
-
-        except Exception as e:
-            logger.error(f"转换 WakeUp 数据到 ICS 失败: {e}")
-            return None
+        self.course_cache.pop(file_path, None)

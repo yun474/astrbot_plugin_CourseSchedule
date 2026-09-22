@@ -16,6 +16,7 @@ from astrbot.api import logger
 from . import constants as c
 
 AVATAR_REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=10, connect=3, sock_read=5)
+SHANGHAI_TZ = timezone(timedelta(hours=8))
 
 class ImageGenerator:
     """图片生成器"""
@@ -134,13 +135,13 @@ class ImageGenerator:
             tuple: (状态文本, 详细信息文本)
         """
         if not start_time or not end_time:
-            return self._get_finished_status(date_type)
-        
+            return "无课程", ""
+
         # 计算完整的时间差，包括天数
         total_seconds_start = int((start_time - now).total_seconds())
         total_seconds_end = int((end_time - now).total_seconds())
-        
-        if total_seconds_start < 0 <= total_seconds_end:
+
+        if total_seconds_start <= 0 < total_seconds_end:
             # 课程进行中
             status_text = "进行中"
             remaining_minutes = total_seconds_end // 60
@@ -168,7 +169,7 @@ class ImageGenerator:
         Returns:
             格式化后的时间文本
         """
-        if total_minutes > 60:
+        if total_minutes >= 60:
             hours = total_minutes // 60
             minutes = total_minutes % 60
             return f"{prefix}{hours} 小时 {minutes} 分钟{suffix}"
@@ -185,53 +186,32 @@ class ImageGenerator:
         Returns:
             tuple: (状态文本, 详细信息文本)
         """
-        status_text = "已结束"
-        if date_type == "today":
-            detail_text = "今日所有课程已结束"
-        elif date_type == "tomorrow":
-            detail_text = "明天所有课程已结束"
-        else:
-            detail_text = f"{date_type}所有课程已结束"
-        return status_text, detail_text
+        return "已结束", f"{self._date_label(date_type)}所有课程已结束"
 
-    async def _fetch_avatars(self, user_ids: List[str]) -> List[Optional[bytes]]:
-        """异步获取多个用户的头像"""
+    @staticmethod
+    def _date_label(date_type: str) -> str:
+        return {"today": "今日", "tomorrow": "明天"}.get(date_type, date_type)
 
-        if not user_ids:
+    async def _fetch_avatars(self, avatar_urls: List[Optional[str]]) -> List[Optional[bytes]]:
+        """异步获取多个头像，URL 为空时跳过"""
+
+        if not avatar_urls:
             return []
 
-        async def fetch_avatar(session: aiohttp.ClientSession, user_id: str):
-            avatar_url = (
-                f"http://q.qlogo.cn/headimg_dl?dst_uin={user_id}&spec=640&img_type=jpg"
-            )
+        async def fetch_avatar(session: aiohttp.ClientSession, avatar_url: Optional[str]):
+            if not avatar_url:
+                return None
             try:
                 async with session.get(avatar_url) as response:
-                    if response.status == 200:
-                        avatar_data = await response.read()
-                        if avatar_data:
-                            return avatar_data
-                        logger.warning(
-                            f"Failed to download avatar for {user_id}: Empty response from server"
-                        )
-                        return None
-                    logger.warning(
-                        f"Failed to download avatar for {user_id}: HTTP {response.status}"
-                    )
-                    return None
-            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-                logger.warning(
-                    f"Failed to fetch avatar for {user_id}: {type(e).__name__} - {e}"
-                )
-                return None
+                    if response.status == 200 and (avatar_data := await response.read()):
+                        return avatar_data
+                    logger.warning(f"头像下载失败 {avatar_url}: HTTP {response.status}")
             except Exception as e:
-                logger.warning(
-                    f"Unexpected error when fetching avatar for {user_id}: {type(e).__name__} - {e}"
-                )
-                return None
+                logger.warning(f"头像下载失败 {avatar_url}: {type(e).__name__} - {e}")
+            return None
 
         async with aiohttp.ClientSession(timeout=AVATAR_REQUEST_TIMEOUT) as session:
-            tasks = [fetch_avatar(session, user_id) for user_id in user_ids]
-            return await asyncio.gather(*tasks)
+            return await asyncio.gather(*(fetch_avatar(session, url) for url in avatar_urls))
 
     def _save_temp_image(self, image: Image.Image) -> str:
         """保存临时图片并返回路径"""
@@ -281,12 +261,12 @@ class ImageGenerator:
         )
 
         y_offset = c.GS_PADDING + 120
-        now = datetime.now(timezone(timedelta(hours=8)))
+        now = datetime.now(SHANGHAI_TZ)
 
         for i, course in enumerate(courses):
             user_id = course.get("user_id", "N/A")
-            nickname = course.get("nickname", user_id)
-            summary = course.get("summary", "无课程信息")
+            nickname = course.get("nickname") or user_id
+            summary = course.get("summary") or "无课程信息"
             start_time: datetime = course.get("start_time")
             end_time: datetime = course.get("end_time")
 
@@ -380,16 +360,19 @@ class ImageGenerator:
         return self._save_temp_image(image)
 
     async def generate_schedule_image(
-        self, courses: List[Dict], date_type: str = "today"
+        self,
+        courses: List[Dict],
+        date_type: str = "today",
+        avatar_urls: List[Optional[str]] | None = None,
     ) -> str:
         """生成课程表图片并返回临时文件路径
 
         Args:
             courses: 课程列表
             date_type: 日期类型，"today", "tomorrow", 或自定义日期类型如"本周三"等
+            avatar_urls: 与 courses 一一对应的头像 URL 列表
         """
-        user_ids = [course.get("user_id", "N/A") for course in courses]
-        avatar_datas = await self._fetch_avatars(user_ids)
+        avatar_datas = await self._fetch_avatars(avatar_urls or [])
         return await asyncio.to_thread(
             self._generate_schedule_image_sync, courses, avatar_datas, date_type
         )
@@ -413,10 +396,10 @@ class ImageGenerator:
         y_offset = c.US_PADDING + 100
 
         for course in courses:
-            summary = course.get("summary", "无课程信息")
+            summary = course.get("summary") or "无课程信息"
             start_time = course.get("start_time")
             end_time = course.get("end_time")
-            location = course.get("location", "未知地点")
+            location = course.get("location") or "未知地点"
 
             self._draw_rounded_rectangle(
                 draw,
@@ -447,7 +430,7 @@ class ImageGenerator:
 
             y_offset += c.US_ROW_HEIGHT
 
-        footer_text = f"生成时间: {datetime.now().strftime('%Y/%m/%d %H:%M:%S')}"
+        footer_text = f"生成时间: {datetime.now(SHANGHAI_TZ).strftime('%Y/%m/%d %H:%M:%S')}"
         draw.text(
             (c.US_PADDING, height - c.US_PADDING),
             footer_text,
@@ -624,10 +607,10 @@ class ImageGenerator:
         end_date: date,
         title: str = "本周上课排行榜",
         subtitle: str | None = None,
+        avatar_urls: List[Optional[str]] | None = None,
     ) -> str:
-        """生成排行榜图片"""
-        user_ids = [data["user_id"] for data in ranking_data]
-        avatar_datas = await self._fetch_avatars(user_ids)
+        """生成排行榜图片，avatar_urls 与 ranking_data 一一对应"""
+        avatar_datas = await self._fetch_avatars(avatar_urls or [])
         return await asyncio.to_thread(
             self._generate_ranking_image_sync,
             ranking_data,

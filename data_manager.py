@@ -6,10 +6,7 @@ import json
 from pathlib import Path
 from typing import Dict
 
-from astrbot.core.star import StarTools
-
-
-from astrbot.core.star import StarMetadata
+from astrbot.core.star import StarMetadata, StarTools
 
 
 class DataManager:
@@ -42,6 +39,6 @@ class DataManager:
         with open(self.user_data_file, "w", encoding="utf-8") as f:
             json.dump(user_data, f, ensure_ascii=False, indent=4)
 
-    def get_ics_file_path(self, user_id: str, group_id: str) -> Path:
-        """获取用户的 ICS 文件路径"""
-        return self.ics_path / f"{user_id}_{group_id}.ics"
+    def get_ics_file_path(self, user_id: str, scope_id: str) -> Path:
+        """获取用户在某个作用域（群号或 private）下的 ICS 文件路径"""
+        return self.ics_path / f"{user_id}_{scope_id}.ics"

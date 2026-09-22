@@ -1,0 +1,42 @@
+{
+  "markdown_mode": {
+    "description": "官bot Markdown 模式",
+    "type": "bool",
+    "default": false,
+    "hint": "仅对 QQ 官方机器人（qq_official / qq_official_webhook）生效。开启后课表以 Markdown 卡片渲染并附带功能按钮，不再发送图片；发送失败会自动回退为图片/文本。其他平台不受影响。"
+  },
+  "markdown_buttons": {
+    "description": "Markdown 卡片附带按钮",
+    "type": "bool",
+    "default": true,
+    "hint": "机器人没有自定义按钮权限时请关闭，只发送 Markdown 文本。"
+  },
+  "markdown_commands": {
+    "description": "各指令 Markdown 开关",
+    "type": "object",
+    "hint": "仅在 Markdown 模式开启时生效，关闭的指令在官bot下仍按图片/文本发送。",
+    "items": {
+      "help": {
+        "description": "课表帮助（Markdown 菜单）",
+        "type": "bool",
+        "default": true
+      },
+      "personal": {
+        "description": "查看课表 / 查看明日课表",
+        "type": "bool",
+        "default": true
+      },
+      "group": {
+        "description": "群友在上什么课 / 群友明天上什么课",
+        "type": "bool",
+        "default": false,
+        "hint": "默认关闭：官bot下群友课表仍发送图片。"
+      },
+      "ranking": {
+        "description": "本周上课排行",
+        "type": "bool",
+        "default": true
+      }
+    }
+  }
+}
