@@ -88,26 +88,36 @@ class ScheduleHelper:
             return []
         return await asyncio.to_thread(self.ics_parser.parse_ics_file, str(ics_file_path))
 
-    async def _load_personal_courses(self, event) -> tuple[list[dict] | None, str | None]:
-        """读取当前用户的全部课程并附上昵称，未绑定时返回提示。"""
-        user_id = event.get_sender_id()
+    async def _load_personal_courses(
+        self, event, user_id: str | None = None
+    ) -> tuple[list[dict] | None, str, str | None]:
+        """读取指定用户（默认发送者）的全部课程，返回 (课程列表, 称呼, 错误信息)。"""
+        sender_id = event.get_sender_id()
+        target_id = user_id or sender_id
         scope_id = self.get_scope_id(event)
-        record = self.get_user_record(scope_id, user_id)
+        record = self.get_user_record(scope_id, target_id)
         if record is None:
-            return None, self.get_bind_hint(scope_id)
-        if not self.data_manager.get_ics_file_path(user_id, scope_id).exists():
-            return None, "课表文件不存在，可能已被删除。请重新绑定。"
+            if target_id == sender_id:
+                return None, "", self.get_bind_hint(scope_id)
+            return None, "", "对方还没有在这里绑定课表哦，可以让 TA 发送 /绑定课表 来绑定。"
+        if not self.data_manager.get_ics_file_path(target_id, scope_id).exists():
+            return None, "", "课表文件不存在，可能已被删除。请重新绑定。"
 
-        courses = await self.load_courses(user_id, scope_id)
+        nickname = record.get("nickname", target_id)
+        courses = await self.load_courses(target_id, scope_id)
         for course in courses:
-            course["nickname"] = record.get("nickname", user_id)
-        return courses, None
+            course["nickname"] = nickname
+        return courses, ("你" if target_id == sender_id else nickname), None
 
     async def get_personal_courses(
-        self, event, target_date: date, include_finished: bool = False
+        self,
+        event,
+        target_date: date,
+        include_finished: bool = False,
+        user_id: str | None = None,
     ) -> tuple[list[dict] | None, str | None]:
         """获取用户某天的课程。默认过滤掉今天已经结束的课。"""
-        courses, error_msg = await self._load_personal_courses(event)
+        courses, subject, error_msg = await self._load_personal_courses(event, user_id)
         if error_msg:
             return None, error_msg
 
@@ -120,27 +130,27 @@ class ScheduleHelper:
         ]
         if not target_courses:
             label = {0: "今天", 1: "明天"}.get((target_date - current.date()).days, format_date(target_date))
-            return None, f"你{label}没有课啦！"
+            return None, f"{subject}{label}没有课啦！"
 
         target_courses.sort(key=lambda c: c["start_time"])
         return target_courses, None
 
     async def get_personal_week_courses(
-        self, event
-    ) -> tuple[list[dict] | None, date, date, str | None]:
+        self, event, user_id: str | None = None
+    ) -> tuple[list[dict] | None, date, date, str, str | None]:
         """获取用户本周（周一到周日）的全部课程。"""
         current_date = today()
         start = current_date - timedelta(days=current_date.weekday())
         end = start + timedelta(days=6)
-        courses, error_msg = await self._load_personal_courses(event)
+        courses, subject, error_msg = await self._load_personal_courses(event, user_id)
         if error_msg:
-            return None, start, end, error_msg
+            return None, start, end, "", error_msg
 
         week_courses = sorted(
             (c for c in courses if start <= c["start_time"].date() <= end),
             key=lambda c: c["start_time"],
         )
-        return week_courses, start, end, None
+        return week_courses, start, end, subject, None
 
     async def get_group_schedule_for_date(
         self, event, target_date: date, is_today: bool = True
@@ -233,20 +243,24 @@ class ScheduleHelper:
             line += f"（{course['description']}）"
         return line
 
-    def format_day_for_llm(self, courses: list[dict], label: str, target_date: date) -> str:
+    def format_day_for_llm(
+        self, courses: list[dict], label: str, target_date: date, subject: str = "你"
+    ) -> str:
         current = now()
         lines = [
             f"现在是 {format_date(current.date())} {current:%H:%M}。",
-            f"{label}（{format_date(target_date)}）共 {len(courses)} 节课：",
+            f"{subject}{label}（{format_date(target_date)}）共 {len(courses)} 节课：",
         ]
         lines += [f"{i}. {self.format_course_line(c)}" for i, c in enumerate(courses, 1)]
         return "\n".join(lines)
 
-    def format_week_for_llm(self, courses: list[dict], start: date, end: date) -> str:
+    def format_week_for_llm(
+        self, courses: list[dict], start: date, end: date, subject: str = "你"
+    ) -> str:
         current = now()
         lines = [
             f"现在是 {format_date(current.date())} {current:%H:%M}。",
-            f"本周（{format_date(start, False)} ~ {format_date(end, False)}）共 {len(courses)} 节课：",
+            f"{subject}本周（{format_date(start, False)} ~ {format_date(end, False)}）共 {len(courses)} 节课：",
         ]
         for offset in range(7):
             day = start + timedelta(days=offset)

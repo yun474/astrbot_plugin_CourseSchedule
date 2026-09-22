@@ -1,3 +1,4 @@
+import re
 import secrets
 import shutil
 import time
@@ -18,6 +19,8 @@ from .schedule_helper import ScheduleHelper, today
 
 BIND_TIMEOUT = 60
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+# 官bot 的艾特在文本里形如 <@!openid>，其他平台走 At 消息段
+AT_TEXT_PATTERN = re.compile(r"<@!?([A-Za-z0-9_\-]+)>")
 
 
 class Main(Star):
@@ -66,6 +69,27 @@ class Main(Star):
                 return [None] * len(user_ids)
             return [f"https://q.qlogo.cn/qqapp/{appid}/{uid}/640" for uid in user_ids]
         return [f"https://q1.qlogo.cn/g?b=qq&nk={uid}&s=640" for uid in user_ids]
+
+    def _resolve_target(self, event: AstrMessageEvent, token: str = "") -> tuple[str, str | None]:
+        """解析要查询的用户：显式参数 > 消息里的艾特 > 发送者自己。
+
+        参数支持 openid / QQ 号、<@!openid> 形式的艾特文本，以及本会话内已绑定的昵称。
+        """
+        token = AT_TEXT_PATTERN.sub(r"\1", token or "").strip()
+        if not token:
+            self_id = str(event.get_self_id())
+            for component in event.get_messages():
+                if isinstance(component, At) and str(component.qq) not in (self_id, "all"):
+                    return str(component.qq), None
+            return event.get_sender_id(), None
+
+        users = self.user_data.get(self.helper.get_scope_id(event), {}).get("users", {})
+        if token in users:
+            return token, None
+        matched = [uid for uid, record in users.items() if record.get("nickname", "").lower() == token.lower()]
+        if len(matched) > 1:
+            return "", f"这里有多位群友都叫「{token}」，请改用 @ 或 openid 指定。"
+        return (matched[0] if matched else token), None
 
     # ---------- 官bot Markdown ----------
 
@@ -247,8 +271,8 @@ class Main(Star):
             "/绑定课表 [昵称] - 用 .ics 文件或 WakeUp 口令绑定课表\n"
             "/关联课表 绑定码 - 复用已绑定的课表\n"
             "/解绑课表 - 解除当前会话的绑定\n"
-            "/查看课表 - 今天还有什么课\n"
-            "/查看明日课表 - 明天有什么课\n"
+            "/查看课表 [@某人] - 今天还有什么课，可查看他人\n"
+            "/查看明日课表 [@某人] - 明天有什么课，可查看他人\n"
             "/群友在上什么课 - 群友当前 / 下一节课程\n"
             "/群友明天上什么课 - 群友明天第一节课\n"
             "/本周上课排行 - 本周上课时长排行\n"
@@ -257,8 +281,15 @@ class Main(Star):
 
     # ---------- 个人课表 ----------
 
-    async def _show_personal_schedule(self, event: AstrMessageEvent, target: date, title: str):
-        courses, error_msg = await self.helper.get_personal_courses(event, target)
+    async def _show_personal_schedule(
+        self, event: AstrMessageEvent, target: date, title: str, token: str = ""
+    ):
+        user_id, error_msg = self._resolve_target(event, token)
+        if error_msg:
+            yield event.plain_result(error_msg)
+            return
+
+        courses, error_msg = await self.helper.get_personal_courses(event, target, user_id=user_id)
         if error_msg:
             yield event.plain_result(error_msg)
             return
@@ -274,16 +305,16 @@ class Main(Star):
         yield event.image_result(image_path)
 
     @filter.command("查看课表")
-    async def show_today_schedule(self, event: AstrMessageEvent):
-        """查看今天还有什么课"""
-        async for result in self._show_personal_schedule(event, today(), "的今日课程"):
+    async def show_today_schedule(self, event: AstrMessageEvent, target: str = ""):
+        """查看今天还有什么课，可带 @某人 / openid 查看他人课表"""
+        async for result in self._show_personal_schedule(event, today(), "的今日课程", target):
             yield result
 
     @filter.command("查看明日课表")
-    async def show_tomorrow_schedule(self, event: AstrMessageEvent):
-        """查看明天有什么课"""
+    async def show_tomorrow_schedule(self, event: AstrMessageEvent, target: str = ""):
+        """查看明天有什么课，可带 @某人 / openid 查看他人课表"""
         async for result in self._show_personal_schedule(
-            event, today() + timedelta(days=1), "的明日课程"
+            event, today() + timedelta(days=1), "的明日课程", target
         ):
             yield result
 
@@ -354,24 +385,37 @@ class Main(Star):
     # ---------- LLM 工具 ----------
 
     @filter.llm_tool(name="course_schedule_query")
-    async def query_schedule_tool(self, event: AstrMessageEvent, scope: str = "today") -> str:
-        """查询当前用户绑定的课表。返回指定范围内的全部课程（含每节课的起止时间、地点）以及当前日期时间，请据此自行判断每节课是已结束、正在进行还是尚未开始，再回答用户。用户询问今天/明天/本周/周几有什么课、还有几节课、几点上课时调用。
+    async def query_schedule_tool(
+        self, event: AstrMessageEvent, scope: str = "today", user_id: str = ""
+    ) -> str:
+        """查询已绑定的课表。返回指定范围内的全部课程（含每节课的起止时间、地点）以及当前日期时间，请据此自行判断每节课是已结束、正在进行还是尚未开始，再回答用户。用户询问自己或某位群友今天/明天/本周有什么课、还有几节课、几点上课时调用。
 
         Args:
             scope(string): 查询范围，只能是 today（今天）、tomorrow（明天）、week（本周，周一到周日）之一
+            user_id(string): 要查询的群友 openid 或 QQ 号，也可填群友昵称；不填则查询当前提问的用户
         """
         scope = (scope or "today").strip().lower()
-        if scope == "week":
-            courses, start, end, error_msg = await self.helper.get_personal_week_courses(event)
-            if error_msg:
-                return error_msg
-            return self.helper.format_week_for_llm(courses, start, end)
-
-        target = today() + timedelta(days=1 if scope == "tomorrow" else 0)
-        courses, error_msg = await self.helper.get_personal_courses(event, target, include_finished=True)
+        target_id, error_msg = self._resolve_target(event, user_id)
         if error_msg:
             return error_msg
-        return self.helper.format_day_for_llm(courses, "明天" if scope == "tomorrow" else "今天", target)
+
+        if scope == "week":
+            courses, start, end, subject, error_msg = await self.helper.get_personal_week_courses(
+                event, user_id=target_id
+            )
+            if error_msg:
+                return error_msg
+            return self.helper.format_week_for_llm(courses, start, end, subject)
+
+        target = today() + timedelta(days=1 if scope == "tomorrow" else 0)
+        courses, error_msg = await self.helper.get_personal_courses(
+            event, target, include_finished=True, user_id=target_id
+        )
+        if error_msg:
+            return error_msg
+        label = "明天" if scope == "tomorrow" else "今天"
+        subject = "你" if target_id == event.get_sender_id() else courses[0]["nickname"]
+        return self.helper.format_day_for_llm(courses, label, target, subject)
 
     async def terminate(self):
         logger.info("Course Schedule plugin terminated.")
