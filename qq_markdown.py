@@ -27,7 +27,7 @@ def at_user(user_id: str) -> str:
 
 
 def command_button(label: str, command: str, style: int = 1) -> dict:
-    """指令按钮：点击后自动以用户身份发送指令（群聊会自动 @机器人）。"""
+    """指令按钮：点击后自动以用户身份发送指令，群聊会自动 @机器人，因此不需要带唤醒词。"""
     return {
         "render_data": {"label": label, "visited_label": label, "style": style},
         "action": {

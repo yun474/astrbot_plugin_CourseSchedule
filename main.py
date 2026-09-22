@@ -67,10 +67,6 @@ class Main(Star):
             return [f"https://q.qlogo.cn/qqapp/{appid}/{uid}/640" for uid in user_ids]
         return [f"https://q1.qlogo.cn/g?b=qq&nk={uid}&s=640" for uid in user_ids]
 
-    def _command(self, name: str) -> str:
-        prefix = (self.context.get_config().get("wake_prefix") or ["/"])[0]
-        return f"{prefix}{name}"
-
     # ---------- 官bot Markdown ----------
 
     def _md_enabled(self, event: AstrMessageEvent, feature: str) -> bool:
@@ -83,20 +79,20 @@ class Main(Star):
     def _card_buttons(self) -> list[list[dict]]:
         return [
             [
-                md.command_button("📅 今日课表", self._command("查看课表")),
-                md.command_button("📚 课表帮助", self._command("课表帮助"), style=0),
+                md.command_button("📅 今日课表", "查看课表"),
+                md.command_button("📚 课表帮助", "课表帮助", style=0),
             ]
         ]
 
     def _help_buttons(self) -> list[list[dict]]:
         return [
             [
-                md.command_button("📥 导入课表", self._command("绑定课表")),
-                md.command_button("📅 今日课表", self._command("查看课表")),
+                md.command_button("📥 导入课表", "绑定课表"),
+                md.command_button("📅 今日课表", "查看课表"),
             ],
             [
-                md.command_button("📆 明日课表", self._command("查看明日课表")),
-                md.command_button("👥 群友在上什么课", self._command("群友在上什么课")),
+                md.command_button("📆 明日课表", "查看明日课表"),
+                md.command_button("👥 群友在上什么课", "群友在上什么课"),
             ],
         ]
 
