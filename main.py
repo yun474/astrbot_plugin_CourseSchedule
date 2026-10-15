@@ -19,8 +19,9 @@ from .schedule_helper import ScheduleHelper, today
 
 BIND_TIMEOUT = 60
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-# 官bot 的艾特在文本里形如 <@!openid>，其他平台走 At 消息段
-AT_TEXT_PATTERN = re.compile(r"<@!?([A-Za-z0-9_\-]+)>")
+# 官bot 不会把艾特其他用户转为 At 段，只在文本里保留 openid 标签：
+# 新格式 <qqbot-at-user id="openid" />，旧格式 <@openid> / <@!openid>；其他平台走 At 消息段
+AT_TEXT_PATTERN = re.compile(r'<qqbot-at-user\s+id="([A-Za-z0-9_\-]+)"\s*/>|<@!?([A-Za-z0-9_\-]+)>')
 
 
 class Main(Star):
@@ -75,16 +76,15 @@ class Main(Star):
     ) -> tuple[str, str | None]:
         """解析要查询的用户：显式参数 > 消息里的艾特 > 发送者自己。
 
-        参数支持 openid / QQ 号、<@!openid> 形式的艾特文本，以及本会话内已绑定的昵称。
+        参数支持 openid / QQ 号、官bot 的 openid 艾特标签，以及本会话内已绑定的昵称。
         """
-        token = AT_TEXT_PATTERN.sub(r"\1", token or "").strip()
-        # OneBot 会将 At 转为 @昵称(QQ号)，昵称含空格时命令参数还可能被截断。
-        # 对这种参数以消息里的真实 At 段为准，不从显示名称猜测用户 ID。
-        if not token or token.startswith("@"):
-            self_id = str(event.get_self_id())
-            for component in event.get_messages():
-                if isinstance(component, At) and str(component.qq) not in (self_id, "all"):
-                    return str(component.qq), None
+        token = AT_TEXT_PATTERN.sub(lambda m: m.group(1) or m.group(2), token or "").strip()
+        # OneBot 会将 At 转为 @昵称(QQ号)，官bot 的 <qqbot-at-user id="..." /> 标签含空格，
+        # 两者都可能被命令参数切开。对这种参数以消息里的真实艾特为准，不从残缺文本猜测用户 ID。
+        if not token or token.startswith(("@", "<")):
+            mentioned = self._mentioned_user(event)
+            if mentioned:
+                return mentioned, None
         if not token:
             return (event.get_sender_id() if default_to_sender else ""), None
 
@@ -97,15 +97,14 @@ class Main(Star):
         return (matched[0] if matched else token), None
 
     @staticmethod
-    def _can_manage_schedules(event: AstrMessageEvent) -> bool:
-        """AstrBot 管理员，以及 OneBot 上报的当前群群主 / 管理员。"""
-        if event.is_admin():
-            return True
-        if event.get_platform_name() != "aiocqhttp" or not event.get_group_id():
-            return False
-        raw = event.message_obj.raw_message
-        sender = raw.get("sender") if isinstance(raw, dict) else None
-        return isinstance(sender, dict) and sender.get("role") in ("owner", "admin")
+    def _mentioned_user(event: AstrMessageEvent) -> str:
+        """返回消息里第一个被艾特的用户，排除机器人自己和全体成员。"""
+        if md.is_qq_official(event):
+            ids = [m.group(1) or m.group(2) for m in AT_TEXT_PATTERN.finditer(event.get_message_str())]
+        else:
+            ids = [str(c.qq) for c in event.get_messages() if isinstance(c, At)]
+        self_id = str(event.get_self_id())
+        return next((uid for uid in ids if uid not in (self_id, "all")), "")
 
     # ---------- 官bot Markdown ----------
 
@@ -292,12 +291,12 @@ class Main(Star):
 
     @filter.command("删除课表")
     async def delete_schedule(self, event: AstrMessageEvent, target: str = ""):
-        """管理员删除本群指定用户的绑定：/删除课表 @某人 / QQ号 / openid / 昵称"""
+        """AstrBot 管理员删除本群指定用户的绑定：/删除课表 @某人 / QQ号 / openid / 昵称"""
         if event.is_private_chat():
             yield event.plain_result(self.helper.get_group_only_message())
             return
-        if not self._can_manage_schedules(event):
-            yield event.plain_result("仅 AstrBot 管理员或本群群主、管理员可以删除他人的课表；官bot 请配置 AstrBot 管理员。")
+        if not event.is_admin():
+            yield event.plain_result("仅 AstrBot 管理员可以删除他人的课表。")
             return
         user_id, error_msg = self._resolve_target(event, target, default_to_sender=False)
         if error_msg:
@@ -328,7 +327,7 @@ class Main(Star):
             "/绑定课表 [昵称] - 用 .ics 文件或 WakeUp 口令绑定课表\n"
             "/关联课表 绑定码 - 复用已绑定的课表\n"
             "/解绑课表 - 解除当前会话的绑定\n"
-            "/删除课表 @某人 - 管理员删除本群指定用户的绑定\n"
+            "/删除课表 @某人 - AstrBot 管理员删除本群指定用户的绑定\n"
             "/查看课表 [@某人] - 今天还有什么课，可查看他人\n"
             "/查看明日课表 [@某人] - 明天有什么课，可查看他人\n"
             "/群友在上什么课 - 群友当前 / 下一节课程\n"

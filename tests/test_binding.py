@@ -174,11 +174,12 @@ class BindingTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("alice", saved["group"]["users"])
         self.assertIn("alice", saved["private"]["users"])
 
-    async def test_onebot_group_admin_and_owner_can_delete(self):
+    async def test_group_owner_or_admin_without_astrbot_admin_cannot_delete(self):
+        path = self.bind()
         for role in ("owner", "admin"):
             with self.subTest(role=role):
-                self.bind()
-                self.assertIn("已删除", await replies(self.app.delete_schedule(event(role=role), "alice")))
+                self.assertIn("仅 AstrBot 管理员", await replies(self.app.delete_schedule(event(role=role), "alice")))
+                self.assertTrue(path.exists())
 
     async def test_official_bot_requires_astrbot_admin(self):
         for platform in ("qq_official", "qq_official_webhook"):
@@ -186,14 +187,6 @@ class BindingTests(unittest.IsolatedAsyncioTestCase):
                 self.bind()
                 self.assertIn("仅 AstrBot 管理员", await replies(self.app.delete_schedule(event(platform=platform, role="owner"), "alice")))
                 self.assertIn("已删除", await replies(self.app.delete_schedule(event(platform=platform, admin=True), "<@!alice>")))
-
-    async def test_malformed_permission_metadata_fails_closed(self):
-        self.bind()
-        for raw in (None, {}, {"sender": None}, {"sender": "admin"}):
-            with self.subTest(raw=raw):
-                request = event()
-                request.message_obj.raw_message = raw
-                self.assertIn("仅 AstrBot 管理员", await replies(self.app.delete_schedule(request, "alice")))
 
     async def test_private_admin_cannot_delete_other_users(self):
         path = self.bind("private")
@@ -220,10 +213,8 @@ class BindingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("多位群友", await replies(self.app.delete_schedule(event(admin=True), "Alice")))
         self.assertEqual(len(self.app.user_data["group"]["users"]), 2)
 
-    async def test_command_dispatch_resolves_onebot_mentions_with_spaces(self):
-        path = self.bind(user="123456")
-        request = event(admin=True, mentions=("bot", "123456"))
-        request.message_str = "删除课表 @Alice Example(123456)"
+    async def dispatch_delete(self, request, message_str):
+        request.message_str = message_str
         request.is_at_or_wake_command = True
         handler = next(
             item for item in star_handlers_registry.star_handlers_map.values()
@@ -231,9 +222,32 @@ class BindingTests(unittest.IsolatedAsyncioTestCase):
         )
         command = next(item for item in handler.event_filters if isinstance(item, CommandFilter))
         self.assertTrue(command.filter(request, {}))
-        text = await replies(self.app.delete_schedule(request, **request.get_extra("parsed_params")))
-        self.assertIn("已删除", text)
+        return await replies(self.app.delete_schedule(request, **request.get_extra("parsed_params")))
+
+    async def test_command_dispatch_resolves_onebot_mentions_with_spaces(self):
+        path = self.bind(user="123456")
+        request = event(admin=True, mentions=("bot", "123456"))
+        self.assertIn("已删除", await self.dispatch_delete(request, "删除课表 @Alice Example(123456)"))
         self.assertFalse(path.exists())
+
+    async def test_command_dispatch_resolves_official_openid_tags(self):
+        for message_str in ('删除课表 <qqbot-at-user id="alice" />', "删除课表 <@!alice>", "删除课表 <@alice>"):
+            with self.subTest(message_str=message_str):
+                path = self.bind()
+                request = event(admin=True, platform="qq_official", mentions=("bot",))
+                self.assertIn("已删除", await self.dispatch_delete(request, message_str))
+                self.assertFalse(path.exists())
+
+    def test_official_query_target_skips_bot_tag(self):
+        request = event(platform="qq_official", mentions=("bot",))
+        request.message_str = '查看课表 <qqbot-at-user id="bot" /> <qqbot-at-user id="alice" />'
+        self.assertEqual(self.app._resolve_target(request, "<qqbot-at-user"), ("alice", None))
+
+    async def test_onebot_ignores_official_tag_text(self):
+        path = self.bind()
+        request = event(admin=True)
+        self.assertIn("还没有", await self.dispatch_delete(request, '删除课表 <qqbot-at-user id="alice" />'))
+        self.assertTrue(path.exists())
 
     async def test_literal_at_text_does_not_impersonate_a_real_mention(self):
         path = self.bind(user="123456")
