@@ -70,18 +70,23 @@ class Main(Star):
             return [f"https://q.qlogo.cn/qqapp/{appid}/{uid}/640" for uid in user_ids]
         return [f"https://q1.qlogo.cn/g?b=qq&nk={uid}&s=640" for uid in user_ids]
 
-    def _resolve_target(self, event: AstrMessageEvent, token: str = "") -> tuple[str, str | None]:
+    def _resolve_target(
+        self, event: AstrMessageEvent, token: str = "", *, default_to_sender: bool = True
+    ) -> tuple[str, str | None]:
         """解析要查询的用户：显式参数 > 消息里的艾特 > 发送者自己。
 
         参数支持 openid / QQ 号、<@!openid> 形式的艾特文本，以及本会话内已绑定的昵称。
         """
         token = AT_TEXT_PATTERN.sub(r"\1", token or "").strip()
-        if not token:
+        # OneBot 会将 At 转为 @昵称(QQ号)，昵称含空格时命令参数还可能被截断。
+        # 对这种参数以消息里的真实 At 段为准，不从显示名称猜测用户 ID。
+        if not token or token.startswith("@"):
             self_id = str(event.get_self_id())
             for component in event.get_messages():
                 if isinstance(component, At) and str(component.qq) not in (self_id, "all"):
                     return str(component.qq), None
-            return event.get_sender_id(), None
+        if not token:
+            return (event.get_sender_id() if default_to_sender else ""), None
 
         users = self.user_data.get(self.helper.get_scope_id(event), {}).get("users", {})
         if token in users:
@@ -90,6 +95,17 @@ class Main(Star):
         if len(matched) > 1:
             return "", f"这里有多位群友都叫「{token}」，请改用 @ 或 openid 指定。"
         return (matched[0] if matched else token), None
+
+    @staticmethod
+    def _can_manage_schedules(event: AstrMessageEvent) -> bool:
+        """AstrBot 管理员，以及 OneBot 上报的当前群群主 / 管理员。"""
+        if event.is_admin():
+            return True
+        if event.get_platform_name() != "aiocqhttp" or not event.get_group_id():
+            return False
+        raw = event.message_obj.raw_message
+        sender = raw.get("sender") if isinstance(raw, dict) else None
+        return isinstance(sender, dict) and sender.get("role") in ("owner", "admin")
 
     # ---------- 官bot Markdown ----------
 
@@ -141,7 +157,12 @@ class Main(Star):
     ) -> str:
         """写入绑定记录并返回绑定码。重新绑定时沿用原有绑定码。"""
         record = self.helper.get_user_record(scope_id, user_id) or {}
-        code = code or record.get("code") or "".join(secrets.choice(CODE_ALPHABET) for _ in range(6))
+        code = code or record.get("code")
+        if not code:
+            while True:
+                code = "".join(secrets.choice(CODE_ALPHABET) for _ in range(6))
+                if self.helper.find_record_by_code(code) is None:
+                    break
         self.helper.save_user_record(scope_id, user_id, {"nickname": nickname, "code": code})
         self.ics_parser.clear_cache(str(self.data_manager.get_ics_file_path(user_id, scope_id)))
         return code
@@ -227,6 +248,13 @@ class Main(Star):
             )
             return
 
+        # 私聊共用 private 作用域；群内则一个绑定码只能属于一位用户。
+        # 校验到写入之间没有 await，避免两个关联请求同时通过检查。
+        if not event.is_private_chat():
+            users = self.user_data.get(scope_id, {}).get("users", {})
+            if any(uid != user_id and record.get("code") == code for uid, record in users.items()):
+                yield event.plain_result("这个绑定码已被本群其他用户绑定，不能重复关联。请使用自己的课表绑定码。")
+                return
         found = self.helper.find_record_by_code(code)
         if not found:
             yield event.plain_result("没有找到这个绑定码，请检查后重试。")
@@ -244,18 +272,47 @@ class Main(Star):
         self._finish_binding(scope_id, user_id, display_name, code=code)
         yield event.plain_result(f"关联成功！课表已复用到{self._session_label(event)}，显示昵称：{display_name}。")
 
-    @filter.command("解绑课表")
-    async def unbind_schedule(self, event: AstrMessageEvent):
-        """解除当前会话的课表绑定"""
-        scope_id = self.helper.get_scope_id(event)
-        user_id = event.get_sender_id()
+    def _remove_binding(self, scope_id: str, user_id: str) -> bool:
+        """清理指定会话的记录、文件、缓存及尚未提交的绑定请求。"""
+        self.binding_requests.pop(f"{scope_id}-{user_id}", None)
         if not self.helper.remove_user_record(scope_id, user_id):
-            yield event.plain_result(f"你在{self._session_label(event)}还没有绑定课表。")
-            return
+            return False
         ics_file_path = self.data_manager.get_ics_file_path(user_id, scope_id)
         self.ics_parser.clear_cache(str(ics_file_path))
         ics_file_path.unlink(missing_ok=True)
+        return True
+
+    @filter.command("解绑课表")
+    async def unbind_schedule(self, event: AstrMessageEvent):
+        """解除当前会话的课表绑定"""
+        if not self._remove_binding(self.helper.get_scope_id(event), event.get_sender_id()):
+            yield event.plain_result(f"你在{self._session_label(event)}还没有绑定课表。")
+            return
         yield event.plain_result(f"已解除{self._session_label(event)}的课表绑定。")
+
+    @filter.command("删除课表")
+    async def delete_schedule(self, event: AstrMessageEvent, target: str = ""):
+        """管理员删除本群指定用户的绑定：/删除课表 @某人 / QQ号 / openid / 昵称"""
+        if event.is_private_chat():
+            yield event.plain_result(self.helper.get_group_only_message())
+            return
+        if not self._can_manage_schedules(event):
+            yield event.plain_result("仅 AstrBot 管理员或本群群主、管理员可以删除他人的课表；官bot 请配置 AstrBot 管理员。")
+            return
+        user_id, error_msg = self._resolve_target(event, target, default_to_sender=False)
+        if error_msg:
+            yield event.plain_result(error_msg)
+            return
+        if not user_id:
+            yield event.plain_result("请指定要删除的用户：/删除课表 @某人（也支持 QQ 号、openid 或已绑定昵称）。")
+            return
+        scope_id = self.helper.get_scope_id(event)
+        record = self.helper.get_user_record(scope_id, user_id)
+        if not self._remove_binding(scope_id, user_id):
+            yield event.plain_result("对方还没有在本群绑定课表。")
+            return
+        nickname = record.get("nickname") or user_id
+        yield event.plain_result(f"已删除「{nickname}」在本群的课表绑定，其他群和私聊的绑定不受影响。")
 
     # ---------- 帮助 ----------
 
@@ -271,6 +328,7 @@ class Main(Star):
             "/绑定课表 [昵称] - 用 .ics 文件或 WakeUp 口令绑定课表\n"
             "/关联课表 绑定码 - 复用已绑定的课表\n"
             "/解绑课表 - 解除当前会话的绑定\n"
+            "/删除课表 @某人 - 管理员删除本群指定用户的绑定\n"
             "/查看课表 [@某人] - 今天还有什么课，可查看他人\n"
             "/查看明日课表 [@某人] - 明天有什么课，可查看他人\n"
             "/群友在上什么课 - 群友当前 / 下一节课程\n"
